@@ -1,0 +1,20 @@
+[
+    {
+        "timestamp": "2025-11-24T01:34:40.808039",
+        "mood": "very good",
+        "energy": "low",
+        "objectives": [
+            "write something in notebook"
+        ],
+        "summary": "We discussed tackling your notebook task in short, focused bursts to manage low energy."
+    },
+    {
+        "timestamp": "2025-11-24T01:41:23.318290",
+        "mood": "very low",
+        "energy": "very low",
+        "objectives": [
+            "sleep"
+        ],
+        "summary": "We discussed aiming for some restful time, perhaps lying down in a quiet, dark room for 15 minutes to help relax, even if sleep doesn't come immediately."
+    }
+]
