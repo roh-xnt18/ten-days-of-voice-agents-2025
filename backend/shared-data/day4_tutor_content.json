@@ -1,0 +1,20 @@
+[
+  {
+    "id": "variables",
+    "title": "Variables",
+    "summary": "Variables are named containers that store values in a program so you can reuse or change them later. They help make code readable and maintainable.",
+    "sample_question": "What is a variable and why is it useful?"
+  },
+  {
+    "id": "loops",
+    "title": "Loops",
+    "summary": "Loops let you repeat a block of code multiple times without rewriting it. For loops are used when you know how many times to repeat; while loops repeat until a condition becomes false.",
+    "sample_question": "Explain the difference between a for loop and a while loop."
+  },
+  {
+    "id": "conditionals",
+    "title": "Conditionals (if-else)",
+    "summary": "Conditionals let your program make decisions based on true or false conditions. They allow different code to run depending on input or situations.",
+    "sample_question": "What is an if-else statement and when would you use it?"
+  }
+]

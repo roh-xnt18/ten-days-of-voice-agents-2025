@@ -1,13 +1,10 @@
-
-
 import logging
 import json
 import os
 import asyncio
 from datetime import datetime
 from typing import Annotated, Literal, List, Optional
-from dataclasses import dataclass, field, asdict
-
+from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 from pydantic import Field
@@ -31,212 +28,356 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
+# =========================
+#   TUTOR CONTENT LOADING
+# =========================
+
+TUTOR_CONTENT_FILE = "shared-data/day4_tutor_content.json"
+
+
+def get_content_path() -> str:
+    """
+    Resolve the JSON content path relative to this backend.
+    Assumes:
+      backend/agent.py
+      shared-data/day4_tutor_content.json
+    """
+    base_dir = os.path.dirname(__file__)
+    backend_dir = os.path.abspath(os.path.join(base_dir, ".."))
+    return os.path.join(backend_dir, TUTOR_CONTENT_FILE)
+
+
+def load_tutor_content() -> List[dict]:
+    """Load the tutor content from JSON file."""
+    path = get_content_path()
+    if not os.path.exists(path):
+        logger.warning(f"Tutor content file not found at {path}")
+        return []
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+            logger.warning("Tutor content JSON is not a list; ignoring.")
+            return []
+    except Exception as e:
+        logger.error(f"Failed to load tutor content: {e}")
+        return []
+
+
+TUTOR_CONTENT_LIST: List[dict] = load_tutor_content()
+TUTOR_CONTENT_BY_ID = {c["id"]: c for c in TUTOR_CONTENT_LIST}
+
+
+# =========================
+#       STATE MODEL
+# =========================
 
 @dataclass
-class CheckInState:
-    """ Holds data for the CURRENT daily check-in"""
-    mood: str | None = None
-    energy: str | None = None
-    objectives: list[str] = field(default_factory=list)
-    advice_given: str | None = None
-    
-    def is_complete(self) -> bool:
-        """ Check if we have the core check-in data"""
-        return all([
-            self.mood is not None,
-            self.energy is not None,
-            len(self.objectives) > 0
-        ])
-    
-    def to_dict(self) -> dict:
-        return asdict(self)
+class MasteryRecord:
+    """Tracks simple interaction counts for a concept in this session."""
+    times_learned: int = 0
+    times_quizzed: int = 0
+    times_taught_back: int = 0
+
+
+@dataclass
+class TutorState:
+    """Holds the tutoring state for the current session."""
+    current_mode: Optional[str] = None  # "learn", "quiz", "teach_back"
+    current_concept_id: Optional[str] = None  # e.g. "variables"
+    mastery: dict[str, MasteryRecord] = field(default_factory=dict)
+
 
 @dataclass
 class Userdata:
-    """ User session data passed to the agent"""
-    current_checkin: CheckInState
-    history_summary: str  # String containing info about previous sessions
+    """User session data passed to the tutor agent."""
+    tutor_state: TutorState
     session_start: datetime = field(default_factory=datetime.now)
 
 
-WELLNESS_LOG_FILE = "wellness_log.json"
-
-def get_log_path():
-    base_dir = os.path.dirname(__file__)
-    backend_dir = os.path.abspath(os.path.join(base_dir, ".."))
-    return os.path.join(backend_dir, WELLNESS_LOG_FILE)
-
-def load_history() -> list:
-    """ Read previous check-ins from JSON"""
-    path = get_log_path()
-    if not os.path.exists(path):
-        return []
-    try:
-        with open(path, "r", encoding='utf-8') as f:
-            data = json.load(f)
-            return data if isinstance(data, list) else []
-    except Exception as e:
-        print(f"⚠️ Could not load history: {e}")
-        return []
-
-def save_checkin_entry(entry: CheckInState) -> None:
-    """💾 Append new check-in to the JSON list"""
-    path = get_log_path()
-    history = load_history()
-    
-    # Create record
-    record = {
-        "timestamp": datetime.now().isoformat(),
-        "mood": entry.mood,
-        "energy": entry.energy,
-        "objectives": entry.objectives,
-        "summary": entry.advice_given
-    }
-    
-    history.append(record)
-    
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding='utf-8') as f:
-        json.dump(history, f, indent=4, ensure_ascii=False)
-        
-    print(f"\n✅ CHECK-IN SAVED TO {path}")
-
+# =========================
+#          TOOLS
+# =========================
 
 @function_tool
-async def record_mood_and_energy(
+async def list_concepts(
     ctx: RunContext[Userdata],
-    mood: Annotated[str, Field(description="The user's emotional state (e.g., happy, stressed, anxious)")],
-    energy: Annotated[str, Field(description="The user's energy level (e.g., high, low, drained, energetic)")],
-) -> str:
-    """📝 Record how the user is feeling. Call this after the user describes their state."""
-    ctx.userdata.current_checkin.mood = mood
-    ctx.userdata.current_checkin.energy = energy
-    
-    print(f"📊 MOOD LOGGED: {mood} | ENERGY: {energy}")
-    
-    return f"I've noted that you are feeling {mood} with {energy} energy. I'm listening."
-
-@function_tool
-async def record_objectives(
-    ctx: RunContext[Userdata],
-    objectives: Annotated[list[str], Field(description="List of 1-3 specific goals the user wants to achieve today")],
-) -> str:
-    """🎯 Record the user's daily goals. Call this when user states what they want to do."""
-    ctx.userdata.current_checkin.objectives = objectives
-    print(f"🎯 OBJECTIVES LOGGED: {objectives}")
-    return "I've written down your goals for the day."
-
-@function_tool
-async def complete_checkin(
-    ctx: RunContext[Userdata],
-    final_advice_summary: Annotated[str, Field(description="A brief 1-sentence summary of the advice given")],
-) -> str:
-    """💾 Finalize the session, provide a recap, and save to JSON. Call at the very end."""
-    state = ctx.userdata.current_checkin
-    state.advice_given = final_advice_summary
-    
-    if not state.is_complete():
-        return "I can't finish yet. I still need to know your mood, energy, or at least one goal."
-
-    # Save to JSON
-    save_checkin_entry(state)
-    
-    print("\n" + "⭐" * 60)
-    print("🎉 WELLNESS CHECK-IN COMPLETED!")
-    print(f"💭 Mood: {state.mood}")
-    print(f"🎯 Goals: {state.objectives}")
-    print("⭐" * 60 + "\n")
-
-    recap = f"""
-    Here is your recap for today:
-    You are feeling {state.mood} and your energy is {state.energy}.
-    Your main goals are: {', '.join(state.objectives)}.
-    
-    Remember: {final_advice_summary}
-    
-    I've saved this in your wellness log. Have a wonderful day!
+) -> List[dict]:
     """
-    return recap
+    📚 List all available concepts with their ids and titles.
+    Use this when the user asks what they can learn or when you need to
+    propose options after they choose a mode.
+    """
+    return [{"id": c["id"], "title": c["title"]} for c in TUTOR_CONTENT_LIST]
 
 
-class WellnessAgent(Agent):
-    def __init__(self, history_context: str):
+@function_tool
+async def get_concept_details(
+    ctx: RunContext[Userdata],
+    concept_id: Annotated[str, Field(description="Concept id, e.g. 'variables' or 'loops'")],
+) -> dict:
+    """
+    🔍 Get details for a specific concept: title, summary, sample question.
+    Use this in ANY mode to drive explanations, quiz questions, or teach-back prompts.
+    """
+    concept = TUTOR_CONTENT_BY_ID.get(concept_id)
+    if not concept:
+        return {"error": f"Unknown concept id '{concept_id}'."}
+    return {
+        "id": concept["id"],
+        "title": concept["title"],
+        "summary": concept["summary"],
+        "sample_question": concept["sample_question"],
+    }
+
+
+@function_tool
+async def set_mode_and_concept(
+    ctx: RunContext[Userdata],
+    mode: Annotated[Literal["learn", "quiz", "teach_back"], Field(description="Learning mode")],
+    concept_id: Annotated[
+        Optional[str],
+        Field(description="Concept id to focus on, e.g. 'variables'. If None, keep current.")
+    ] = None,
+) -> str:
+    """
+    🎛️ Set the current learning mode and (optionally) the active concept.
+    The LLM should call this whenever the user chooses a mode or switches.
+    """
+    state = ctx.userdata.tutor_state
+    state.current_mode = mode
+    if concept_id is not None:
+        state.current_concept_id = concept_id
+
+    logger.info(f"Mode set to {mode}, concept: {state.current_concept_id}")
+    if concept_id:
+        return f"Mode set to {mode} and concept set to {concept_id}."
+    return f"Mode set to {mode}. Concept unchanged."
+
+
+@function_tool
+async def update_mastery(
+    ctx: RunContext[Userdata],
+    concept_id: Annotated[str, Field(description="Concept id being practiced")],
+    interaction_type: Annotated[
+        Literal["learn", "quiz", "teach_back"],
+        Field(description="Type of interaction to count for mastery"),
+    ],
+) -> str:
+    """
+    📈 Update simple mastery counters for a given concept in this session.
+    Call this:
+      - after explaining a concept in learn mode (interaction_type='learn')
+      - after a quiz question in quiz mode ('quiz')
+      - after evaluating a teach-back ('teach_back')
+    """
+    state = ctx.userdata.tutor_state
+    record = state.mastery.get(concept_id)
+    if record is None:
+        record = MasteryRecord()
+        state.mastery[concept_id] = record
+
+    if interaction_type == "learn":
+        record.times_learned += 1
+    elif interaction_type == "quiz":
+        record.times_quizzed += 1
+    elif interaction_type == "teach_back":
+        record.times_taught_back += 1
+
+    logger.info(
+        f"Mastery updated for {concept_id}: "
+        f"L={record.times_learned}, Q={record.times_quizzed}, T={record.times_taught_back}"
+    )
+
+    return (
+        f"Updated mastery for {concept_id}. "
+        f"Learned: {record.times_learned}, "
+        f"Quizzed: {record.times_quizzed}, "
+        f"Teach-back: {record.times_taught_back}."
+    )
+
+
+@function_tool
+async def weakest_concepts(
+    ctx: RunContext[Userdata],
+) -> str:
+    """
+    🧩 Return a simple description of which concepts are 'weakest'
+    based on having the fewest total interactions in this session.
+    Use this if the user asks: 'Which concepts am I weakest at?'
+    """
+    state = ctx.userdata.tutor_state
+
+    if not state.mastery:
+        return (
+            "We haven't practiced enough yet to know your weaker areas. "
+            "Try learning, quizzing, or teaching back a concept first."
+        )
+
+    # Calculate totals per concept
+    scores = []
+    for cid, record in state.mastery.items():
+        total = record.times_learned + record.times_quizzed + record.times_taught_back
+        scores.append((cid, total))
+
+    # Sort ascending: fewer interactions = weaker
+    scores.sort(key=lambda x: x[1])
+    weakest = scores[:2]  # show up to 2 weakest
+
+    desc_parts = []
+    for cid, total in weakest:
+        concept = TUTOR_CONTENT_BY_ID.get(cid, {"title": cid})
+        desc_parts.append(f"{concept['title']} (id: {cid}) with {total} total interactions")
+
+    return (
+        "Based on this session, the concepts you've practiced least are: "
+        + "; ".join(desc_parts)
+        + ". You might want to spend a bit more time on these."
+    )
+
+
+# =========================
+#         AGENT
+# =========================
+
+class TutorAgent(Agent):
+    def __init__(self):
+        # Embed content so the LLM can see it directly
+        content_str = json.dumps(TUTOR_CONTENT_LIST, indent=2, ensure_ascii=False)
+
         super().__init__(
             instructions=f"""
-            You are a compassionate, supportive Daily Wellness Companion.
-            
-            🧠 **CONTEXT FROM PREVIOUS SESSIONS:**
-            {history_context}
-            
-            🎯 **GOALS FOR THIS SESSION:**
-            1. **Check-in:** Ask how they are feeling (Mood) and their energy levels.
-               - *Reference the history context if available (e.g., "Last time you were tired, how is today?").*
-            2. **Intentions:** Ask for 1-3 simple objectives for the day.
-            3. **Support:** Offer small, grounded, NON-MEDICAL advice.
-               - Example: "Try a 5-minute walk" or "Break that big task into small steps."
-            4. **Recap & Save:** Summarize their mood and goals, then call 'complete_checkin'.
+You are "Teach-the-Tutor", an active recall coach for beginner programming concepts.
 
-            🚫 **SAFETY GUARDRAILS:**
-            - You are NOT a doctor or therapist.
-            - Do NOT diagnose conditions or prescribe treatments.
-            - If a user mentions self-harm or severe crisis, gently suggest professional help immediately.
+You support THREE learning modes:
+1. "learn"      – explain the concept clearly and simply.
+2. "quiz"       – ask questions and check understanding.
+3. "teach_back" – let the learner explain the concept back and give feedback.
 
-            🛠️ **Use the tools to record data as the user speaks.**
-            """,
+You are running inside a voice agent built with LiveKit and Murf Falcon.
+Behave like an encouraging but realistic programming tutor.
+
+========================
+COURSE CONTENT (JSON)
+========================
+Use ONLY these concepts when teaching:
+{content_str}
+
+Each concept has:
+- id
+- title
+- summary      → base explanation
+- sample_question → good starting question
+
+========================
+        BEHAVIOR
+========================
+
+GENERAL:
+- First greet the user.
+- Briefly explain the three modes: learn, quiz, teach-back.
+- Ask which mode they want and which concept to start with.
+- If the user doesn't know what to pick, call 'list_concepts' and propose 1–3 options.
+
+STATE:
+- Use 'set_mode_and_concept' whenever the user chooses or switches a mode,
+  and when they choose a concept (like "variables" or "loops").
+- You can call 'get_concept_details' to retrieve the summary and sample_question.
+
+LEARN MODE:
+- Call 'set_mode_and_concept' with mode='learn'.
+- Use the concept's summary as the base explanation.
+- Break explanations into small, spoken-friendly chunks.
+- Use simple examples and analogies.
+- After explaining, ask 1–2 quick check questions like:
+  "Does that make sense?" or "Want a quick example?"
+- Call 'update_mastery' with interaction_type='learn' for that concept.
+
+QUIZ MODE:
+- Call 'set_mode_and_concept' with mode='quiz'.
+- Start with the concept's 'sample_question'.
+- Ask ONE question at a time, wait for the answer, then respond.
+- Give short feedback: say what they got right, and gently correct mistakes.
+- Ask follow-up questions that dig deeper into the summary.
+- Call 'update_mastery' with interaction_type='quiz' after each question-response cycle.
+
+TEACH_BACK MODE:
+- Call 'set_mode_and_concept' with mode='teach_back'.
+- Prompt the learner to explain the concept in their own words, as if teaching a friend.
+  You can base the prompt on the 'sample_question'.
+- Let them speak without interrupting.
+- Then compare their explanation to the summary:
+  - Mention 1–2 things they did well.
+  - Mention 1–2 important points they missed or could clarify better.
+- Keep feedback short and concrete.
+- Call 'update_mastery' with interaction_type='teach_back'.
+
+MODE SWITCHING:
+- At any time, the user may say things like:
+  - "Switch to quiz mode."
+  - "I want to teach it back now."
+  - "Can we go back to learning?"
+- When they do, acknowledge briefly, call 'set_mode_and_concept' with the new mode
+  (and the same or a new concept), then continue in that mode's style.
+
+MASTERY & WEAK AREAS:
+- After some practice, the user might ask:
+  "Which concepts am I weakest at?"
+- Call 'weakest_concepts' and read the result to them.
+
+IMPORTANT:
+- Do NOT invent new concepts that are not in the JSON.
+- Keep explanations and questions short and voice-friendly.
+- You are not a medical or mental-health advisor; stay in the domain of learning programming.
+""",
             tools=[
-                record_mood_and_energy,
-                record_objectives,
-                complete_checkin,
+                list_concepts,
+                get_concept_details,
+                set_mode_and_concept,
+                update_mastery,
+                weakest_concepts,
             ],
         )
 
 
+# =========================
+#   LIVEKIT / SESSION SETUP
+# =========================
+
 def prewarm(proc: JobProcess):
+    # Preload VAD model for faster startup
     proc.userdata["vad"] = silero.VAD.load()
+
 
 async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
 
-    
-    
-    # 1. Load History from JSON
-    history = load_history()
-    history_summary = "No previous history found. This is the first session."
-    
-    if history:
-        last_entry = history[-1]
-        history_summary = (
-            f"Last check-in was on {last_entry.get('timestamp', 'unknown date')}. "
-            f"User felt {last_entry.get('mood')} with {last_entry.get('energy')} energy. "
-            f"Their goals were: {', '.join(last_entry.get('objectives', []))}."
-        )
-        print("📜 HISTORY LOADED:", history_summary)
-    else:
-        print("📜 NO HISTORY FOUND.")
-
-    # 2. Initialize Session Data
+    # Initialize session data
     userdata = Userdata(
-        current_checkin=CheckInState(),
-        history_summary=history_summary
+        tutor_state=TutorState(),
     )
 
-    # 3. Setup Agent
+    # Create a single Tutor agent + session
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
         llm=google.LLM(model="gemini-2.5-flash"),
+        # NOTE: single voice here; for the video you can
+        # experiment with different voices by changing this.
+        # e.g. "Matthew", "Alicia", "Ken" from Murf Falcon voices.
         tts=murf.TTS(
-            voice="en-US-natalie", # Using a softer, more caring voice
-            style="Promo",         # Often sounds more enthusiastic/supportive
+            voice="Matthew",   # Murf Falcon voice name (edit as needed)
+            style="Promo",
             text_pacing=True,
         ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         userdata=userdata,
     )
-    
-    # 4. Start
+
     await session.start(
-        agent=WellnessAgent(history_context=history_summary),
+        agent=TutorAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC()
@@ -244,6 +385,7 @@ async def entrypoint(ctx: JobContext):
     )
 
     await ctx.connect()
+
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
