@@ -28,9 +28,7 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
-# =========================
-#   TUTOR CONTENT LOADING
-# =========================
+
 
 TUTOR_CONTENT_FILE = "shared-data/day4_tutor_content.json"
 
@@ -70,9 +68,6 @@ TUTOR_CONTENT_LIST: List[dict] = load_tutor_content()
 TUTOR_CONTENT_BY_ID = {c["id"]: c for c in TUTOR_CONTENT_LIST}
 
 
-# =========================
-#       STATE MODEL
-# =========================
 
 @dataclass
 class MasteryRecord:
@@ -97,16 +92,13 @@ class Userdata:
     session_start: datetime = field(default_factory=datetime.now)
 
 
-# =========================
-#          TOOLS
-# =========================
 
 @function_tool
 async def list_concepts(
     ctx: RunContext[Userdata],
 ) -> List[dict]:
     """
-    📚 List all available concepts with their ids and titles.
+    List all available concepts with their ids and titles.
     Use this when the user asks what they can learn or when you need to
     propose options after they choose a mode.
     """
@@ -119,7 +111,7 @@ async def get_concept_details(
     concept_id: Annotated[str, Field(description="Concept id, e.g. 'variables' or 'loops'")],
 ) -> dict:
     """
-    🔍 Get details for a specific concept: title, summary, sample question.
+    Get details for a specific concept: title, summary, sample question.
     Use this in ANY mode to drive explanations, quiz questions, or teach-back prompts.
     """
     concept = TUTOR_CONTENT_BY_ID.get(concept_id)
@@ -143,7 +135,7 @@ async def set_mode_and_concept(
     ] = None,
 ) -> str:
     """
-    🎛️ Set the current learning mode and (optionally) the active concept.
+    Set the current learning mode and (optionally) the active concept.
     The LLM should call this whenever the user chooses a mode or switches.
     """
     state = ctx.userdata.tutor_state
@@ -167,7 +159,7 @@ async def update_mastery(
     ],
 ) -> str:
     """
-    📈 Update simple mastery counters for a given concept in this session.
+    Update simple mastery counters for a given concept in this session.
     Call this:
       - after explaining a concept in learn mode (interaction_type='learn')
       - after a quiz question in quiz mode ('quiz')
@@ -204,7 +196,7 @@ async def weakest_concepts(
     ctx: RunContext[Userdata],
 ) -> str:
     """
-    🧩 Return a simple description of which concepts are 'weakest'
+    Return a simple description of which concepts are 'weakest'
     based on having the fewest total interactions in this session.
     Use this if the user asks: 'Which concepts am I weakest at?'
     """
@@ -216,15 +208,13 @@ async def weakest_concepts(
             "Try learning, quizzing, or teaching back a concept first."
         )
 
-    # Calculate totals per concept
     scores = []
     for cid, record in state.mastery.items():
         total = record.times_learned + record.times_quizzed + record.times_taught_back
         scores.append((cid, total))
 
-    # Sort ascending: fewer interactions = weaker
     scores.sort(key=lambda x: x[1])
-    weakest = scores[:2]  # show up to 2 weakest
+    weakest = scores[:2] 
 
     desc_parts = []
     for cid, total in weakest:
@@ -238,13 +228,11 @@ async def weakest_concepts(
     )
 
 
-# =========================
-#         AGENT
-# =========================
+
 
 class TutorAgent(Agent):
     def __init__(self):
-        # Embed content so the LLM can see it directly
+        
         content_str = json.dumps(TUTOR_CONTENT_LIST, indent=2, ensure_ascii=False)
 
         super().__init__(
@@ -342,32 +330,25 @@ IMPORTANT:
         )
 
 
-# =========================
-#   LIVEKIT / SESSION SETUP
-# =========================
+
 
 def prewarm(proc: JobProcess):
-    # Preload VAD model for faster startup
     proc.userdata["vad"] = silero.VAD.load()
 
 
 async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
 
-    # Initialize session data
     userdata = Userdata(
         tutor_state=TutorState(),
     )
 
-    # Create a single Tutor agent + session
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
         llm=google.LLM(model="gemini-2.5-flash"),
-        # NOTE: single voice here; for the video you can
-        # experiment with different voices by changing this.
-        # e.g. "Matthew", "Alicia", "Ken" from Murf Falcon voices.
+    
         tts=murf.TTS(
-            voice="Matthew",   # Murf Falcon voice name (edit as needed)
+            voice="Matthew", 
             style="Promo",
             text_pacing=True,
         ),
