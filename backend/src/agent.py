@@ -1,20 +1,4 @@
 # IMPROVE THE AGENT AS PER YOUR NEED 1
-"""
-Day 8 – Voice Game Master (D&D-Style Adventure) - Voice-only GM agent
-
-- Uses LiveKit agent plumbing similar to the provided food_agent_sqlite example.
-- GM persona, universe, tone and rules are encoded in the agent instructions.
-- Keeps STT/TTS/Turn detector/VAD integration untouched (murf, deepgram, silero, turn_detector).
-- Tools:
-    - start_adventure(): start a fresh session and introduce the scene
-    - get_scene(): return the current scene description (GM text) ending with "What do you do?"
-    - player_action(action_text): accept player's spoken action, update state, advance scene
-    - show_journal(): list remembered facts, NPCs, named locations, choices
-    - show_status(): show character HP, traits, and inventory
-    - roll_check(): perform a simple dice/check roll for risky actions
-    - restart_adventure(): reset state and start over
-- Userdata keeps continuity between turns: history, inventory, named NPCs/locations, choices, current_scene, basic character sheet
-"""
 
 import json
 import logging
@@ -43,9 +27,7 @@ from livekit.agents import (
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-# -------------------------
-# Logging
-# -------------------------
+
 logger = logging.getLogger("voice_game_master")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
@@ -54,10 +36,7 @@ logger.addHandler(handler)
 
 load_dotenv(".env.local")
 
-# -------------------------
-# Simple Game World Definition
-# -------------------------
-# A compact world with a few scenes and choices forming a mini-arc.
+
 WORLD = {
     "intro": {
         "title": "A Shadow over Brinmere",
@@ -410,9 +389,6 @@ def summarize_scene_transition(old_scene: str, action_key: str, result_scene: st
     return f"You chose '{action_key.replace('_', ' ')}'."
 
 
-# -------------------------
-# Agent Tools (function_tool)
-# -------------------------
 
 @function_tool
 async def start_adventure(
