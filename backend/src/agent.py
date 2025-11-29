@@ -342,9 +342,7 @@ class Userdata:
     started_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
 
 
-# -------------------------
-# Helper functions
-# -------------------------
+
 def scene_text(scene_key: str, userdata: Userdata) -> str:
     """
     Build the descriptive text for the current scene, and append choices as short hints.
@@ -352,7 +350,7 @@ def scene_text(scene_key: str, userdata: Userdata) -> str:
     """
     scene = WORLD.get(scene_key)
     if not scene:
-        # Fallback if a scene is missing or mis-typed
+      
         scene_key = "intro"
         userdata.current_scene = "intro"
         scene = WORLD[scene_key]
@@ -361,7 +359,7 @@ def scene_text(scene_key: str, userdata: Userdata) -> str:
     for cid, cmeta in scene.get("choices", {}).items():
         desc += f"- {cmeta['desc']} (you can say: '{cid.replace('_', ' ')}')\n"
 
-    # GM MUST end with the action prompt
+   
     desc += "\nWhat do you do?"
     return desc
 
@@ -512,10 +510,8 @@ async def player_action(
     # Update current scene
     userdata.current_scene = result_scene
 
-    # Build narrative reply: echo a short confirmation, then describe next scene
     next_desc = scene_text(result_scene, userdata)
 
-    # A small flourish so the GM sounds more persona-driven
     persona_pre = (
         "The Game Master, Aurek — a calm, slightly mysterious narrator — replies:\n\n"
     )
