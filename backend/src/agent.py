@@ -1,17 +1,30 @@
+# IMPROVE THE AGENT AS PER YOUR NEED 1
+"""
+Day 8 – Voice Game Master (D&D-Style Adventure) - Voice-only GM agent
+
+- Uses LiveKit agent plumbing similar to the provided food_agent_sqlite example.
+- GM persona, universe, tone and rules are encoded in the agent instructions.
+- Keeps STT/TTS/Turn detector/VAD integration untouched (murf, deepgram, silero, turn_detector).
+- Tools:
+    - start_adventure(): start a fresh session and introduce the scene
+    - get_scene(): return the current scene description (GM text) ending with "What do you do?"
+    - player_action(action_text): accept player's spoken action, update state, advance scene
+    - show_journal(): list remembered facts, NPCs, named locations, choices
+    - show_status(): show character HP, traits, and inventory
+    - roll_check(): perform a simple dice/check roll for risky actions
+    - restart_adventure(): reset state and start over
+- Userdata keeps continuity between turns: history, inventory, named NPCs/locations, choices, current_scene, basic character sheet
+"""
+
+import json
 import logging
-<<<<<<< HEAD
-import os
-import json
-import datetime
-from typing import List
-=======
-import json
 import os
 import asyncio
-from datetime import datetime
-from typing import Annotated, Literal, List, Optional
+import uuid
+import random
 from dataclasses import dataclass, field
->>>>>>> 100084a579b31092df708570aaaa429c588e5914
+from datetime import datetime
+from typing import List, Dict, Optional, Annotated
 
 from dotenv import load_dotenv
 from pydantic import Field
@@ -23,481 +36,746 @@ from livekit.agents import (
     RoomInputOptions,
     WorkerOptions,
     cli,
-    metrics,
-<<<<<<< HEAD
-    tokenize,
     function_tool,
     RunContext,
-=======
-    MetricsCollectedEvent,
-    RunContext,
-    function_tool,
->>>>>>> 100084a579b31092df708570aaaa429c588e5914
 )
 
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-logger = logging.getLogger("agent")
+# -------------------------
+# Logging
+# -------------------------
+logger = logging.getLogger("voice_game_master")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.addHandler(handler)
+
 load_dotenv(".env.local")
 
+# -------------------------
+# Simple Game World Definition
+# -------------------------
+# A compact world with a few scenes and choices forming a mini-arc.
+WORLD = {
+    "intro": {
+        "title": "A Shadow over Brinmere",
+        "desc": (
+            "You awake on the damp shore of Brinmere, the moon a thin silver crescent. "
+            "A ruined watchtower smolders a short distance inland, and a narrow path leads "
+            "towards a cluster of cottages to the east. In the water beside you lies a "
+            "small, carved wooden box, half-buried in sand."
+        ),
+        "choices": {
+            "inspect_box": {
+                "desc": "Inspect the carved wooden box at the water's edge.",
+                "result_scene": "box",
+            },
+            "approach_tower": {
+                "desc": "Head inland towards the smoldering watchtower.",
+                "result_scene": "tower",
+            },
+            "walk_to_cottages": {
+                "desc": "Follow the path east towards the cottages.",
+                "result_scene": "cottages",  # NOTE: not defined yet, could be extended later
+            },
+        },
+    },
+    "box": {
+        "title": "The Box",
+        "desc": (
+            "The box is warm despite the night air. Inside is a folded scrap of parchment "
+            "with a hatch-marked map and the words: 'Beneath the tower, the latch sings.' "
+            "As you read, a faint whisper seems to come from the tower, as if the wind "
+            "itself speaks your name."
+        ),
+        "choices": {
+            "take_map": {
+                "desc": "Take the map and keep it.",
+                "result_scene": "tower_approach",
+                "effects": {
+                    "add_journal": "Found map fragment: 'Beneath the tower, the latch sings.'"
+                },
+            },
+            "leave_box": {
+                "desc": "Leave the box where it is.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "tower": {
+        "title": "The Watchtower",
+        "desc": (
+            "The watchtower's stonework is cracked and warm embers glow within. An iron "
+            "latch covers a hatch at the base — it looks old but recently used. You can "
+            "try the latch, look for other entrances, or retreat."
+        ),
+        "choices": {
+            "try_latch_without_map": {
+                "desc": "Try the iron latch without any clue.",
+                "result_scene": "latch_fail",
+            },
+            "search_around": {
+                "desc": "Search the nearby rubble for another entrance.",
+                "result_scene": "secret_entrance",
+            },
+            "retreat": {
+                "desc": "Step back to the shoreline.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "tower_approach": {
+        "title": "Toward the Tower",
+        "desc": (
+            "Clutching the map, you approach the watchtower. The map's marks align with "
+            "the hatch at the base, and you notice a faint singing resonance when you step close."
+        ),
+        "choices": {
+            "open_hatch": {
+                "desc": "Use the map clue and try the hatch latch carefully.",
+                "result_scene": "latch_open",
+                "effects": {"add_journal": "Used map clue to open the hatch."},
+            },
+            "search_around": {
+                "desc": "Search for another entrance.",
+                "result_scene": "secret_entrance",
+            },
+            "retreat": {
+                "desc": "Return to the shore.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "latch_fail": {
+        "title": "A Bad Twist",
+        "desc": (
+            "You twist the latch without heed — the mechanism sticks, and the effort sends "
+            "a shiver through the ground. From inside the tower, something rustles in alarm."
+        ),
+        "choices": {
+            "run_away": {
+                "desc": "Run back to the shore.",
+                "result_scene": "intro",
+            },
+            "stand_ground": {
+                "desc": "Stand and prepare for whatever emerges.",
+                "result_scene": "tower_combat",
+            },
+        },
+    },
+    "latch_open": {
+        "title": "The Hatch Opens",
+        "desc": (
+            "With the map's guidance the latch yields and the hatch opens with a breath of cold air. "
+            "Inside, a spiral of rough steps leads down into an ancient cellar lit by phosphorescent moss."
+        ),
+        "choices": {
+            "descend": {
+                "desc": "Descend into the cellar.",
+                "result_scene": "cellar",
+            },
+            "close_hatch": {
+                "desc": "Close the hatch and reconsider.",
+                "result_scene": "tower_approach",
+            },
+        },
+    },
+    "secret_entrance": {
+        "title": "A Narrow Gap",
+        "desc": (
+            "Behind a pile of rubble you find a narrow gap and old rope leading downward. "
+            "It smells of cold iron and something briny."
+        ),
+        "choices": {
+            "squeeze_in": {
+                "desc": "Squeeze through the gap and follow the rope down.",
+                "result_scene": "cellar",
+            },
+            "mark_and_return": {
+                "desc": "Mark the spot and return to the shore.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "cellar": {
+        "title": "Cellar of Echoes",
+        "desc": (
+            "The cellar opens into a circular chamber where runes glow faintly. At the center "
+            "is a stone plinth and upon it a small brass key and a sealed scroll."
+        ),
+        "choices": {
+            "take_key": {
+                "desc": "Pick up the brass key.",
+                "result_scene": "cellar_key",
+                "effects": {
+                    "add_inventory": "brass_key",
+                    "add_journal": "Found brass key on plinth.",
+                },
+            },
+            "open_scroll": {
+                "desc": "Break the seal and read the scroll.",
+                "result_scene": "scroll_reveal",
+                "effects": {
+                    "add_journal": "Scroll reads: 'The tide remembers what the villagers forget.'"
+                },
+            },
+            "leave_quietly": {
+                "desc": "Leave the cellar and close the hatch behind you.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "cellar_key": {
+        "title": "Key in Hand",
+        "desc": (
+            "With the key in your hand the runes dim and a hidden panel slides open, revealing a "
+            "small statue that begins to hum. A voice, ancient and kind, asks: 'Will you return what was taken?'"
+        ),
+        "choices": {
+            "pledge_help": {
+                "desc": "Pledge to return what was taken.",
+                "result_scene": "reward",
+                "effects": {"add_journal": "You pledged to return what was taken."},
+            },
+            "refuse": {
+                "desc": "Refuse and pocket the key.",
+                "result_scene": "cursed_key",
+                "effects": {
+                    "add_journal": "You pocketed the key; a weight grows in your pocket."
+                },
+            },
+        },
+    },
+    "scroll_reveal": {
+        "title": "The Scroll",
+        "desc": (
+            "The scroll tells of an heirloom taken by a water spirit that dwells beneath the tower. "
+            "It hints that the brass key 'speaks' when offered with truth."
+        ),
+        "choices": {
+            "search_for_key": {
+                "desc": "Search the plinth for a key.",
+                "result_scene": "cellar_key",
+            },
+            "leave_quietly": {
+                "desc": "Leave the cellar and keep the knowledge to yourself.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "tower_combat": {
+        "title": "Something Emerges",
+        "desc": (
+            "A hunched, brine-soaked creature scrambles out from the tower. Its eyes glow with hunger. "
+            "You must act quickly."
+        ),
+        "choices": {
+            "fight": {
+                "desc": "Fight the creature.",
+                "result_scene": "fight_win",
+            },
+            "flee": {
+                "desc": "Flee back to the shore.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "fight_win": {
+        "title": "After the Scuffle",
+        "desc": (
+            "You manage to fend off the creature; it flees wailing towards the sea. On the ground lies "
+            "a small locket engraved with a crest — likely the heirloom mentioned in the scroll."
+        ),
+        "choices": {
+            "take_locket": {
+                "desc": "Take the locket and examine it.",
+                "result_scene": "reward",
+                "effects": {
+                    "add_inventory": "engraved_locket",
+                    "add_journal": "Recovered an engraved locket.",
+                },
+            },
+            "leave_locket": {
+                "desc": "Leave the locket and tend to your wounds.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "reward": {
+        "title": "A Minor Resolution",
+        "desc": (
+            "A small sense of peace settles over Brinmere. Villagers may one day know the heirloom is found, or it may remain a secret. "
+            "You feel the night shift; the little arc of your story here closes for now."
+        ),
+        "choices": {
+            "end_session": {
+                "desc": "End the session and return to the shore (conclude mini-arc).",
+                "result_scene": "intro",
+            },
+            "keep_exploring": {
+                "desc": "Keep exploring for more mysteries.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "cursed_key": {
+        "title": "A Weight in the Pocket",
+        "desc": (
+            "The brass key glows coldly. You feel a heavy sorrow that tugs at your thoughts. "
+            "Perhaps the key demands something in return..."
+        ),
+        "choices": {
+            "seek_redemption": {
+                "desc": "Seek a way to make amends.",
+                "result_scene": "reward",
+            },
+            "bury_key": {
+                "desc": "Bury the key and hope the weight fades.",
+                "result_scene": "intro",
+            },
+        },
+    },
+}
 
-<<<<<<< HEAD
-class Assistant(Agent):
-    def __init__(self) -> None:
-        super().__init__(
-            instructions="""
-You are a friendly coffee shop barista for a specialty coffee brand called "Rohan's Roastery".
-
-Your only job is to help the customer place a coffee order by asking clear, simple questions.
-You must maintain an internal coffee order with the following fields:
-
-- drinkType: type of drink (e.g., latte, cappuccino, americano, cold brew)
-- size: small, medium, or large
-- milk: e.g., regular, skim, soy, almond, oat
-- extras: a list of extras (e.g., extra shot, caramel syrup, vanilla, whipped cream)
-- name: the customer's name
-
-Behavior rules:
-- Start by greeting the user as a barista and asking what they would like.
-- If some fields are missing or unclear, ask polite follow-up questions.
-- Ask only one or two things at a time so it's easy to answer.
-- Keep the conversation short, natural, and to the point.
-- Once you are confident that all fields (drinkType, size, milk, extras, name) are filled,
-  call the `finalize_order` tool exactly once with the values you collected.
-- After the tool returns, clearly summarize the final order to the user and thank them.
-
-Never talk about tools, JSON, files, or internal state directly to the user.
-Stay in-character as a barista at all times.
-""",
-        )
-
-    @function_tool
-    async def finalize_order(
-        self,
-        context: RunContext,
-        drinkType: str,
-        size: str,
-        milk: str,
-        extras: List[str],
-        name: str,
-    ) -> str:
-        """
-        Finalize the coffee order and save it to a JSON file.
-
-        Use this tool only when the order is complete and all fields are known.
-        """
-
-        order = {
-            "drinkType": drinkType,
-            "size": size,
-            "milk": milk,
-            "extras": extras,
-            "name": name,
-        }
-
-        # Ensure the orders directory exists (relative to backend working directory)
-        os.makedirs("orders", exist_ok=True)
-
-        # Create a timestamped filename
-        ts = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-        filename = f"order-{ts}.json"
-        path = os.path.join("orders", filename)
-
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(order, f, indent=2)
-
-        logger.info("Saved order to %s: %s", path, order)
-
-        extras_text = ", ".join(extras) if extras else "no extras"
-
-        # This string is for the model to read and then confirm back to the user
-        return (
-            f"Order saved: {size} {drinkType} with {milk} milk, "
-            f"{extras_text}, for {name}. File name: {filename}."
-        )
-=======
-
-TUTOR_CONTENT_FILE = "shared-data/day4_tutor_content.json"
-
-
-def get_content_path() -> str:
-    """
-    Resolve the JSON content path relative to this backend.
-    Assumes:
-      backend/agent.py
-      shared-data/day4_tutor_content.json
-    """
-    base_dir = os.path.dirname(__file__)
-    backend_dir = os.path.abspath(os.path.join(base_dir, ".."))
-    return os.path.join(backend_dir, TUTOR_CONTENT_FILE)
-
-
-def load_tutor_content() -> List[dict]:
-    """Load the tutor content from JSON file."""
-    path = get_content_path()
-    if not os.path.exists(path):
-        logger.warning(f"Tutor content file not found at {path}")
-        return []
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                return data
-            logger.warning("Tutor content JSON is not a list; ignoring.")
-            return []
-    except Exception as e:
-        logger.error(f"Failed to load tutor content: {e}")
-        return []
-
-
-TUTOR_CONTENT_LIST: List[dict] = load_tutor_content()
-TUTOR_CONTENT_BY_ID = {c["id"]: c for c in TUTOR_CONTENT_LIST}
-
-
-
-@dataclass
-class MasteryRecord:
-    """Tracks simple interaction counts for a concept in this session."""
-    times_learned: int = 0
-    times_quizzed: int = 0
-    times_taught_back: int = 0
-
-
-@dataclass
-class TutorState:
-    """Holds the tutoring state for the current session."""
-    current_mode: Optional[str] = None  # "learn", "quiz", "teach_back"
-    current_concept_id: Optional[str] = None  # e.g. "variables"
-    mastery: dict[str, MasteryRecord] = field(default_factory=dict)
-
-
+# -------------------------
+# Per-session Userdata
+# -------------------------
 @dataclass
 class Userdata:
-    """User session data passed to the tutor agent."""
-    tutor_state: TutorState
-    session_start: datetime = field(default_factory=datetime.now)
+    # Default player name is Rohan unless overridden in-game
+    player_name: Optional[str] = "Rohan"
+
+    current_scene: str = "intro"
+    history: List[Dict] = field(default_factory=list)  # list of {'scene', 'action', 'time', 'result_scene'}
+    journal: List[str] = field(default_factory=list)
+    inventory: List[str] = field(default_factory=list)
+    named_npcs: Dict[str, str] = field(default_factory=dict)
+    choices_made: List[str] = field(default_factory=list)
+
+    # Simple character sheet
+    health: int = 10
+    max_health: int = 10
+    traits: Dict[str, int] = field(default_factory=lambda: {"luck": 1, "wit": 1, "grit": 1})
+
+    session_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    started_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
 
 
-
-@function_tool
-async def list_concepts(
-    ctx: RunContext[Userdata],
-) -> List[dict]:
+# -------------------------
+# Helper functions
+# -------------------------
+def scene_text(scene_key: str, userdata: Userdata) -> str:
     """
-    List all available concepts with their ids and titles.
-    Use this when the user asks what they can learn or when you need to
-    propose options after they choose a mode.
+    Build the descriptive text for the current scene, and append choices as short hints.
+    Always end with 'What do you do?' so the voice flow prompts player input.
     """
-    return [{"id": c["id"], "title": c["title"]} for c in TUTOR_CONTENT_LIST]
+    scene = WORLD.get(scene_key)
+    if not scene:
+        # Fallback if a scene is missing or mis-typed
+        scene_key = "intro"
+        userdata.current_scene = "intro"
+        scene = WORLD[scene_key]
+
+    desc = f"{scene['desc']}\n\nChoices:\n"
+    for cid, cmeta in scene.get("choices", {}).items():
+        desc += f"- {cmeta['desc']} (you can say: '{cid.replace('_', ' ')}')\n"
+
+    # GM MUST end with the action prompt
+    desc += "\nWhat do you do?"
+    return desc
 
 
-@function_tool
-async def get_concept_details(
-    ctx: RunContext[Userdata],
-    concept_id: Annotated[str, Field(description="Concept id, e.g. 'variables' or 'loops'")],
-) -> dict:
-    """
-    Get details for a specific concept: title, summary, sample question.
-    Use this in ANY mode to drive explanations, quiz questions, or teach-back prompts.
-    """
-    concept = TUTOR_CONTENT_BY_ID.get(concept_id)
-    if not concept:
-        return {"error": f"Unknown concept id '{concept_id}'."}
-    return {
-        "id": concept["id"],
-        "title": concept["title"],
-        "summary": concept["summary"],
-        "sample_question": concept["sample_question"],
+def apply_effects(effects: dict, userdata: Userdata):
+    if not effects:
+        return
+    if "add_journal" in effects:
+        userdata.journal.append(effects["add_journal"])
+    if "add_inventory" in effects:
+        userdata.inventory.append(effects["add_inventory"])
+    # Extendable for more effect keys later
+
+
+def summarize_scene_transition(old_scene: str, action_key: str, result_scene: str, userdata: Userdata) -> str:
+    """Record the transition into history and return a short narrative the GM can use."""
+    entry = {
+        "from": old_scene,
+        "action": action_key,
+        "to": result_scene,
+        "time": datetime.utcnow().isoformat() + "Z",
     }
+    userdata.history.append(entry)
+    userdata.choices_made.append(action_key)
+    return f"You chose '{action_key.replace('_', ' ')}'."
 
+
+# -------------------------
+# Agent Tools (function_tool)
+# -------------------------
 
 @function_tool
-async def set_mode_and_concept(
+async def start_adventure(
     ctx: RunContext[Userdata],
-    mode: Annotated[Literal["learn", "quiz", "teach_back"], Field(description="Learning mode")],
-    concept_id: Annotated[
-        Optional[str],
-        Field(description="Concept id to focus on, e.g. 'variables'. If None, keep current.")
-    ] = None,
+    player_name: Annotated[Optional[str], Field(description="Player name", default=None)] = None,
 ) -> str:
-    """
-    Set the current learning mode and (optionally) the active concept.
-    The LLM should call this whenever the user chooses a mode or switches.
-    """
-    state = ctx.userdata.tutor_state
-    state.current_mode = mode
-    if concept_id is not None:
-        state.current_concept_id = concept_id
+    """Initialize a new adventure session for the player and return the opening description."""
+    userdata = ctx.userdata
+    if player_name:
+        userdata.player_name = player_name
+    else:
+        # If nothing is provided, fall back to default (Rohan for this build)
+        userdata.player_name = userdata.player_name or "Rohan"
 
-    logger.info(f"Mode set to {mode}, concept: {state.current_concept_id}")
-    if concept_id:
-        return f"Mode set to {mode} and concept set to {concept_id}."
-    return f"Mode set to {mode}. Concept unchanged."
+    userdata.current_scene = "intro"
+    userdata.history = []
+    userdata.journal = []
+    userdata.inventory = []
+    userdata.named_npcs = {}
+    userdata.choices_made = []
+    userdata.health = userdata.max_health
+    userdata.traits = userdata.traits or {"luck": 1, "wit": 1, "grit": 1}
+    userdata.session_id = str(uuid.uuid4())[:8]
+    userdata.started_at = datetime.utcnow().isoformat() + "Z"
+
+    opening = (
+        f"Greetings {userdata.player_name or 'traveler'}. "
+        f"Welcome to '{WORLD['intro']['title']}' on the shores of Brinmere.\n\n"
+        + scene_text("intro", userdata)
+    )
+    # Ensure GM prompt present
+    if not opening.endswith("What do you do?"):
+        opening += "\nWhat do you do?"
+    return opening
 
 
 @function_tool
-async def update_mastery(
+async def get_scene(
     ctx: RunContext[Userdata],
-    concept_id: Annotated[str, Field(description="Concept id being practiced")],
-    interaction_type: Annotated[
-        Literal["learn", "quiz", "teach_back"],
-        Field(description="Type of interaction to count for mastery"),
+) -> str:
+    """Return the current scene description (useful for 'remind me where I am')."""
+    userdata = ctx.userdata
+    scene_k = userdata.current_scene or "intro"
+    txt = scene_text(scene_k, userdata)
+    return txt
+
+
+@function_tool
+async def player_action(
+    ctx: RunContext[Userdata],
+    action: Annotated[
+        str,
+        Field(
+            description="Player spoken action or the short action code (e.g., 'inspect_box' or 'take the box')"
+        ),
     ],
 ) -> str:
     """
-    Update simple mastery counters for a given concept in this session.
-    Call this:
-      - after explaining a concept in learn mode (interaction_type='learn')
-      - after a quiz question in quiz mode ('quiz')
-      - after evaluating a teach-back ('teach_back')
+    Accept player's action (natural language or action key), try to resolve it to a defined choice,
+    update userdata, advance to the next scene and return the GM's next description (ending with 'What do you do?').
     """
-    state = ctx.userdata.tutor_state
-    record = state.mastery.get(concept_id)
-    if record is None:
-        record = MasteryRecord()
-        state.mastery[concept_id] = record
+    userdata = ctx.userdata
+    current = userdata.current_scene or "intro"
+    scene = WORLD.get(current)
+    if not scene:
+        current = "intro"
+        userdata.current_scene = "intro"
+        scene = WORLD[current]
 
-    if interaction_type == "learn":
-        record.times_learned += 1
-    elif interaction_type == "quiz":
-        record.times_quizzed += 1
-    elif interaction_type == "teach_back":
-        record.times_taught_back += 1
+    action_text = (action or "").strip()
 
-    logger.info(
-        f"Mastery updated for {concept_id}: "
-        f"L={record.times_learned}, Q={record.times_quizzed}, T={record.times_taught_back}"
+    # Attempt 1: match exact action key (e.g., 'inspect_box')
+    chosen_key = None
+    if action_text.lower() in (scene.get("choices") or {}):
+        chosen_key = action_text.lower()
+
+    # Attempt 2: fuzzy match by checking if action_text contains the choice key or descriptive words
+    if not chosen_key:
+        lowered = action_text.lower()
+        for cid, cmeta in (scene.get("choices") or {}).items():
+            desc = cmeta.get("desc", "").lower()
+            if cid in lowered:
+                chosen_key = cid
+                break
+            first_words = " ".join(desc.split()[:4])
+            if first_words and first_words in lowered:
+                chosen_key = cid
+                break
+
+    # Attempt 3: fallback by simple keyword matching against choice descriptions
+    if not chosen_key:
+        lowered = action_text.lower()
+        for cid, cmeta in (scene.get("choices") or {}).items():
+            for keyword in cmeta.get("desc", "").lower().split():
+                if keyword and keyword in lowered:
+                    chosen_key = cid
+                    break
+            if chosen_key:
+                break
+
+    if not chosen_key:
+        # If we still can't resolve, ask a clarifying GM response but keep it short and end with prompt.
+        resp = (
+            "I didn't quite catch that action for this situation. "
+            "Try one of the listed choices or use a simple phrase like 'inspect the box' or 'go to the tower'.\n\n"
+            + scene_text(current, userdata)
+        )
+        return resp
+
+    # Apply the chosen choice
+    choice_meta = scene["choices"].get(chosen_key)
+    result_scene = choice_meta.get("result_scene", current)
+    effects = choice_meta.get("effects", None)
+
+    # Apply effects (inventory/journal, etc.)
+    apply_effects(effects or {}, userdata)
+
+    # Record transition
+    _note = summarize_scene_transition(current, chosen_key, result_scene, userdata)
+
+    # Update current scene
+    userdata.current_scene = result_scene
+
+    # Build narrative reply: echo a short confirmation, then describe next scene
+    next_desc = scene_text(result_scene, userdata)
+
+    # A small flourish so the GM sounds more persona-driven
+    persona_pre = (
+        "The Game Master, Aurek — a calm, slightly mysterious narrator — replies:\n\n"
     )
-
-    return (
-        f"Updated mastery for {concept_id}. "
-        f"Learned: {record.times_learned}, "
-        f"Quizzed: {record.times_quizzed}, "
-        f"Teach-back: {record.times_taught_back}."
-    )
+    reply = f"{persona_pre}{_note}\n\n{next_desc}"
+    # ensure final prompt present
+    if not reply.endswith("What do you do?"):
+        reply += "\nWhat do you do?"
+    return reply
 
 
 @function_tool
-async def weakest_concepts(
+async def show_journal(
+    ctx: RunContext[Userdata],
+) -> str:
+    """Return a summary of journal entries, inventory, and recent choices."""
+    userdata = ctx.userdata
+    lines = []
+    lines.append(f"Session: {userdata.session_id} | Started at: {userdata.started_at}")
+    if userdata.player_name:
+        lines.append(f"Player: {userdata.player_name}")
+    if userdata.journal:
+        lines.append("\nJournal entries:")
+        for j in userdata.journal:
+            lines.append(f"- {j}")
+    else:
+        lines.append("\nJournal is empty.")
+    if userdata.inventory:
+        lines.append("\nInventory:")
+        for it in userdata.inventory:
+            lines.append(f"- {it}")
+    else:
+        lines.append("\nNo items in inventory.")
+    lines.append("\nRecent choices:")
+    for h in userdata.history[-6:]:
+        lines.append(f"- {h['time']} | from {h['from']} -> {h['to']} via {h['action']}")
+    lines.append("\nWhat do you do?")
+    return "\n".join(lines)
+
+
+@function_tool
+async def show_status(
     ctx: RunContext[Userdata],
 ) -> str:
     """
-    Return a simple description of which concepts are 'weakest'
-    based on having the fewest total interactions in this session.
-    Use this if the user asks: 'Which concepts am I weakest at?'
+    Show the player's current health, traits, and inventory.
+    Useful for questions like: 'What is my health?' or 'What do I have with me?'
     """
-    state = ctx.userdata.tutor_state
+    userdata = ctx.userdata
+    lines = []
+    lines.append(f"Traveler status for {userdata.player_name or 'the traveler'}:")
+    lines.append(f"- Health: {userdata.health}/{userdata.max_health}")
 
-    if not state.mastery:
-        return (
-            "We haven't practiced enough yet to know your weaker areas. "
-            "Try learning, quizzing, or teaching back a concept first."
+    if userdata.traits:
+        lines.append("\nTraits:")
+        for name, value in userdata.traits.items():
+            lines.append(f"- {name.capitalize()}: {value}")
+
+    if userdata.inventory:
+        lines.append("\nYou are carrying:")
+        for it in userdata.inventory:
+            lines.append(f"- {it}")
+    else:
+        lines.append("\nYou are not carrying anything notable yet.")
+
+    lines.append("\nWhat do you do?")
+    return "\n".join(lines)
+
+
+@function_tool
+async def roll_check(
+    ctx: RunContext[Userdata],
+    reason: Annotated[str, Field(description="What the player is trying to do, in natural language.")],
+    difficulty: Annotated[
+        int,
+        Field(
+            description="Rough difficulty from 5 (easy) to 20 (hard).",
+            ge=1,
+            le=30,
+        ),
+    ] = 10,
+) -> str:
+    """
+    Perform a simple dice check with a d20, plus a small modifier from traits.
+    Returns a short narrative summary that the GM can build on.
+    """
+    userdata = ctx.userdata
+
+    # Basic d20 roll with a modifier from traits (luck + wit + grit)
+    base_roll = random.randint(1, 20)
+    modifier = int(userdata.traits.get("luck", 0)) + int(userdata.traits.get("wit", 0)) // 2
+    total = base_roll + modifier
+
+    outcome: str
+    if total >= difficulty + 5:
+        outcome = "strong_success"
+    elif total >= difficulty:
+        outcome = "success"
+    elif total >= difficulty - 4:
+        outcome = "partial"
+    else:
+        outcome = "fail"
+
+    # If the failure is harsh, apply a small health penalty
+    penalty_text = ""
+    if outcome == "fail" and userdata.health > 0:
+        userdata.health = max(0, userdata.health - 1)
+        penalty_text = (
+            " The effort stings; you feel yourself a little weaker. "
+            f"Your health is now {userdata.health}/{userdata.max_health}."
         )
 
-    scores = []
-    for cid, record in state.mastery.items():
-        total = record.times_learned + record.times_quizzed + record.times_taught_back
-        scores.append((cid, total))
+    outcome_text = {
+        "strong_success": "You succeed with style.",
+        "success": "You manage to succeed.",
+        "partial": "You partly succeed, but there is a cost or complication.",
+        "fail": "You fail, and the situation may get worse.",
+    }[outcome]
 
-    scores.sort(key=lambda x: x[1])
-    weakest = scores[:2] 
-
-    desc_parts = []
-    for cid, total in weakest:
-        concept = TUTOR_CONTENT_BY_ID.get(cid, {"title": cid})
-        desc_parts.append(f"{concept['title']} (id: {cid}) with {total} total interactions")
-
-    return (
-        "Based on this session, the concepts you've practiced least are: "
-        + "; ".join(desc_parts)
-        + ". You might want to spend a bit more time on these."
+    msg = (
+        f"For the action: '{reason}', Aurek rolls a d20.\n"
+        f"Roll: {base_roll} + modifier {modifier} = {total} vs difficulty {difficulty}.\n"
+        f"Outcome: {outcome_text}{penalty_text}\n\n"
+        "What do you do?"
     )
+    return msg
 
 
+@function_tool
+async def restart_adventure(
+    ctx: RunContext[Userdata],
+) -> str:
+    """Reset the userdata and start again."""
+    userdata = ctx.userdata
+    userdata.current_scene = "intro"
+    userdata.history = []
+    userdata.journal = []
+    userdata.inventory = []
+    userdata.named_npcs = {}
+    userdata.choices_made = []
+    userdata.health = userdata.max_health
+    userdata.traits = {"luck": 1, "wit": 1, "grit": 1}
+    userdata.session_id = str(uuid.uuid4())[:8]
+    userdata.started_at = datetime.utcnow().isoformat() + "Z"
+    greeting = (
+        "The world resets. A new tide laps at the shore. You stand once more at the beginning.\n\n"
+        + scene_text("intro", userdata)
+    )
+    if not greeting.endswith("What do you do?"):
+        greeting += "\nWhat do you do?"
+    return greeting
 
 
-class TutorAgent(Agent):
+# -------------------------
+# The Agent (GameMasterAgent)
+# -------------------------
+class GameMasterAgent(Agent):
     def __init__(self):
-        
-        content_str = json.dumps(TUTOR_CONTENT_LIST, indent=2, ensure_ascii=False)
+        # System instructions define Universe, Tone, Role
+        instructions = """
+        You are 'Aurek', the Game Master (GM) for a voice-only, Dungeons-and-Dragons-style short adventure.
+        Primary player name is Rohan, unless the player introduces a different name.
+        Universe: Low-magic coastal fantasy (village of Brinmere, tide-smoothed ruins, minor spirits).
+        Tone: Slightly mysterious, dramatic, empathetic (not overly scary).
+        Role: You are the GM. You describe scenes vividly, remember the player's past choices, named NPCs,
+              inventory and locations, and you always end your descriptive messages with the prompt: 'What do you do?'.
 
+        World & State:
+            - The Python WORLD constant defines scenes and choices.
+            - The userdata object keeps session state: current_scene, history, journal, inventory, health, traits, etc.
+            - Do NOT invent new Python keys; instead, track nuances via journal entries and narrative.
+
+        Tools:
+            - Use start_adventure() at the beginning of a session to initialize the story.
+            - Use get_scene() to remind the player where they are.
+            - Use player_action() to apply a player's spoken action and move to the next scene.
+            - Use show_journal() or show_status() when the player asks about what they've done, what they carry,
+              or how hurt they are.
+            - Use roll_check() when the player attempts something risky or uncertain and you want a dice-based outcome.
+            - Use restart_adventure() if the player wants to reset the story.
+
+        Behaviour:
+            - Keep continuity using the per-session userdata. Reference journal items, inventory and health when relevant.
+            - Drive short sessions (aim for several meaningful turns). Reach a small narrative arc (e.g., resolving the heirloom).
+            - This agent is voice-first: responses should be concise enough for spoken delivery but still evocative.
+            - Every GM message to the player MUST end with the exact words: 'What do you do?'.
+        """
         super().__init__(
-            instructions=f"""
-You are "Teach-the-Tutor", an active recall coach for beginner programming concepts.
-
-You support THREE learning modes:
-1. "learn"      – explain the concept clearly and simply.
-2. "quiz"       – ask questions and check understanding.
-3. "teach_back" – let the learner explain the concept back and give feedback.
-
-You are running inside a voice agent built with LiveKit and Murf Falcon.
-Behave like an encouraging but realistic programming tutor.
-
-========================
-COURSE CONTENT (JSON)
-========================
-Use ONLY these concepts when teaching:
-{content_str}
-
-Each concept has:
-- id
-- title
-- summary      → base explanation
-- sample_question → good starting question
-
-========================
-        BEHAVIOR
-========================
-
-GENERAL:
-- First greet the user.
-- Briefly explain the three modes: learn, quiz, teach-back.
-- Ask which mode they want and which concept to start with.
-- If the user doesn't know what to pick, call 'list_concepts' and propose 1–3 options.
-
-STATE:
-- Use 'set_mode_and_concept' whenever the user chooses or switches a mode,
-  and when they choose a concept (like "variables" or "loops").
-- You can call 'get_concept_details' to retrieve the summary and sample_question.
-
-LEARN MODE:
-- Call 'set_mode_and_concept' with mode='learn'.
-- Use the concept's summary as the base explanation.
-- Break explanations into small, spoken-friendly chunks.
-- Use simple examples and analogies.
-- After explaining, ask 1–2 quick check questions like:
-  "Does that make sense?" or "Want a quick example?"
-- Call 'update_mastery' with interaction_type='learn' for that concept.
-
-QUIZ MODE:
-- Call 'set_mode_and_concept' with mode='quiz'.
-- Start with the concept's 'sample_question'.
-- Ask ONE question at a time, wait for the answer, then respond.
-- Give short feedback: say what they got right, and gently correct mistakes.
-- Ask follow-up questions that dig deeper into the summary.
-- Call 'update_mastery' with interaction_type='quiz' after each question-response cycle.
-
-TEACH_BACK MODE:
-- Call 'set_mode_and_concept' with mode='teach_back'.
-- Prompt the learner to explain the concept in their own words, as if teaching a friend.
-  You can base the prompt on the 'sample_question'.
-- Let them speak without interrupting.
-- Then compare their explanation to the summary:
-  - Mention 1–2 things they did well.
-  - Mention 1–2 important points they missed or could clarify better.
-- Keep feedback short and concrete.
-- Call 'update_mastery' with interaction_type='teach_back'.
-
-MODE SWITCHING:
-- At any time, the user may say things like:
-  - "Switch to quiz mode."
-  - "I want to teach it back now."
-  - "Can we go back to learning?"
-- When they do, acknowledge briefly, call 'set_mode_and_concept' with the new mode
-  (and the same or a new concept), then continue in that mode's style.
-
-MASTERY & WEAK AREAS:
-- After some practice, the user might ask:
-  "Which concepts am I weakest at?"
-- Call 'weakest_concepts' and read the result to them.
-
-IMPORTANT:
-- Do NOT invent new concepts that are not in the JSON.
-- Keep explanations and questions short and voice-friendly.
-- You are not a medical or mental-health advisor; stay in the domain of learning programming.
-""",
+            instructions=instructions,
             tools=[
-                list_concepts,
-                get_concept_details,
-                set_mode_and_concept,
-                update_mastery,
-                weakest_concepts,
+                start_adventure,
+                get_scene,
+                player_action,
+                show_journal,
+                show_status,
+                roll_check,
+                restart_adventure,
             ],
         )
 
 
->>>>>>> 100084a579b31092df708570aaaa429c588e5914
-
-
+# -------------------------
+# Entrypoint & Prewarm (keeps speech functionality)
+# -------------------------
 def prewarm(proc: JobProcess):
-    proc.userdata["vad"] = silero.VAD.load()
+    # load VAD model and stash on process userdata, try/catch like original file
+    try:
+        proc.userdata["vad"] = silero.VAD.load()
+    except Exception:
+        logger.warning("VAD prewarm failed; continuing without preloaded VAD.")
 
 
 async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
+    logger.info("\n" + "🎲" * 8)
+    logger.info("🚀 STARTING VOICE GAME MASTER (Brinmere Mini-Arc)")
 
-<<<<<<< HEAD
-    # Set up a voice AI pipeline using Deepgram, Gemini, Murf, and the LiveKit turn detector
-    session = AgentSession(
-        # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
-        # See all available models at https://docs.livekit.io/agents/models/stt/
-        stt=deepgram.STT(model="nova-3"),
-        # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-        # See all available models at https://docs.livekit.io/agents/models/llm/
-        llm=google.LLM(
-            model="gemini-2.5-flash",
-        ),
-        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
-        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
-        tts=murf.TTS(
-            voice="en-US-matthew",
-            style="Conversation",
-            tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-            text_pacing=True,
-        ),
-        # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
-        # See more at https://docs.livekit.io/agents/build/turns
-        turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
-        # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
-        preemptive_generation=True,
-    )
-
-    # Metrics collection, to measure pipeline performance
-    # For more information, see https://docs.livekit.io/agents/build/metrics/
-    usage_collector = metrics.UsageCollector()
-
-    @session.on("metrics_collected")
-    def _on_metrics_collected(ev: MetricsCollectedEvent):
-        metrics.log_metrics(ev.metrics)
-        usage_collector.collect(ev.metrics)
-
-    async def log_usage():
-        summary = usage_collector.get_summary()
-        logger.info(f"Usage: {summary}")
-
-    ctx.add_shutdown_callback(log_usage)
-
-    # Start the session, which initializes the voice pipeline and warms up the models
-=======
-    userdata = Userdata(
-        tutor_state=TutorState(),
-    )
+    userdata = Userdata()
 
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
         llm=google.LLM(model="gemini-2.5-flash"),
-    
         tts=murf.TTS(
-            voice="Matthew", 
-            style="Promo",
+            voice="en-US-marcus",
+            style="Conversational",
             text_pacing=True,
         ),
         turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
+        vad=ctx.proc.userdata.get("vad"),
         userdata=userdata,
     )
 
->>>>>>> 100084a579b31092df708570aaaa429c588e5914
+    # Start the agent session with the GameMasterAgent
     await session.start(
-        agent=TutorAgent(),
+        agent=GameMasterAgent(),
         room=ctx.room,
-        room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.BVC()
-        ),
+        room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()),
     )
 
     await ctx.connect()
