@@ -10,6 +10,15 @@ const publicSans = Public_Sans({
   subsets: ['latin'],
 });
 
+const GLOBAL_STYLES = `
+  :root {
+    --primary: #002cf2;
+    --primary-hover: color-mix(in srgb, #002cf2 80%, #000);
+    /* put any other stable CSS variables here */
+  }
+`;
+
+
 const commitMono = localFont({
   display: 'swap',
   variable: '--font-commit-mono',
@@ -58,7 +67,7 @@ export default async function RootLayout({ children }: RootLayoutProps) {
       )}
     >
       <head>
-        {styles && <style>{styles}</style>}
+        <style dangerouslySetInnerHTML={{ __html: GLOBAL_STYLES }} />
         <title>{pageTitle}</title>
         <meta name="description" content={pageDescription} />
         <ApplyThemeScript />
